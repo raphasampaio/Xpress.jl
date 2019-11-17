@@ -285,12 +285,12 @@ function MOI.supports_constraint(
     return true
 end
 
-# TODO
-# function MOI.supports_constraint(
-#     ::Optimizer, ::Type{MOI.VectorOfVariables}, ::Type{F}
-# ) where {F <: Union{MOI.SOS1{Float64}, MOI.SOS2{Float64}, MOI.SecondOrderCone}}
-#     return true
-# end
+# TODO, include MOI.SecondOrderCone
+function MOI.supports_constraint(
+     ::Optimizer, ::Type{MOI.VectorOfVariables}, ::Type{F}
+ ) where {F <: Union{MOI.SOS1{Float64}, MOI.SOS2{Float64}}}
+     return true
+ end
 
 # TODO
 # We choose _not_ to support ScalarAffineFunction-in-Interval and
@@ -1758,7 +1758,7 @@ end
 ### VectorOfVariables-in-SOS{I|II}
 ###
 
-#=
+
 
 const SOS = Union{MOI.SOS1{Float64}, MOI.SOS2{Float64}}
 
@@ -1854,7 +1854,6 @@ function MOI.get(
     ])
 end
 
-=#
 
 ###
 ### Optimize methods.

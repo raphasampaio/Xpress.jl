@@ -4,14 +4,15 @@ module Xpress
 
     using Libdl
 
-    # Load in `deps.jl`, complaining if it does not exist
-    const depsjl_path = joinpath(@__DIR__, "..", "deps", "deps.jl")
+    # # Load in `deps.jl`, complaining if it does not exist
+    # const depsjl_path = joinpath(@__DIR__, "..", "deps", "deps.jl")
 
-    if !isfile(depsjl_path)
-        error("XPRESS cannot be loaded. Please run Pkg.build(\"Xpress\").")
-    end
+    # if !isfile(depsjl_path)
+    #     error("XPRESS cannot be loaded. Please run Pkg.build(\"Xpress\").")
+    # end
 
-    include(depsjl_path)
+    # include(depsjl_path)
+    const libxprs = "xprs.dll"
 
     ### imports
 
@@ -56,8 +57,9 @@ module Xpress
 
     include("MOI/MOI_wrapper.jl")
 
+	println("foca")
     function __init__()
-        Xpress.initialize()
+        # Xpress.initialize()
     end
 
 end

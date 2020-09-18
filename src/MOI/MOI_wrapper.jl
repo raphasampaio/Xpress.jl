@@ -1,5 +1,5 @@
 @static if v"1.2" > VERSION >= v"1.1"
-    # see: https://github.com/jump-dev/Xpress.jl/pull/44#issuecomment-585882858
+    # see: https://github.com/JuliaOpt/Xpress.jl/pull/44#issuecomment-585882858
     error("Versions 1.1.x of julia are not supported. The current verions is $(VERSION)")
 end
 
@@ -145,22 +145,6 @@ mutable struct CachedSolution
     solve_time::Float64
 end
 
-mutable struct BasisStatus
-    con_status::Vector{Cint}
-    var_status::Vector{Cint}
-end
-
-mutable struct IISData
-    stat::Cint
-    is_standard_iis::Bool
-    rownumber::Int # number of rows participating in the IIS
-    colnumber::Int # number of columns participating in the IIS
-    miisrow::Vector{Cint} # index of the rows that participate
-    miiscol::Vector{Cint} # index of the columns that participate
-    constrainttype::Vector{UInt8} # sense of the rows that participate
-    colbndtype::Vector{UInt8} # sense of the column bounds that participate
-end
-
 mutable struct Optimizer <: MOI.AbstractOptimizer
     # The low-level Xpress model.
     inner::XpressProblem
@@ -172,9 +156,6 @@ mutable struct Optimizer <: MOI.AbstractOptimizer
     # parameter.
     # Windows is always silent, callback or external file must be used
     silent::Bool
-
-    # turn off warning by the MOI interface implementation [advanced usage]
-    moi_warnings::Bool
 
     # An enum to remember what objective is currently stored in the model.
     objective_type::ObjectiveType
@@ -213,8 +194,7 @@ mutable struct Optimizer <: MOI.AbstractOptimizer
     # TODO: add functionality to the lower-level API to support querying single
     # elements of the solution.
     cached_solution::Union{Nothing, CachedSolution}
-    basis_status::Union{Nothing,BasisStatus}
-    conflict::Union{Nothing, IISData}
+    conflict #::Union{Nothing, ConflictRefinerData}
 
     # Callback fields.
     callback_variable_primal::Vector{Float64}
@@ -235,7 +215,6 @@ mutable struct Optimizer <: MOI.AbstractOptimizer
 
         model.params = Dict{Any,Any}()
         model.silent = false
-        model.moi_warnings = true
 
         for (name, value) in kwargs
             name = MOI.RawParameter(string(name))
@@ -252,9 +231,8 @@ mutable struct Optimizer <: MOI.AbstractOptimizer
         model.affine_constraint_info = Dict{Int, ConstraintInfo}()
         model.sos_constraint_info = Dict{Int, ConstraintInfo}()
         model.callback_variable_primal = Float64[]
-        model.basis_status = nothing
-        model.conflict = nothing
         MOI.empty!(model)  # MOI.empty!(model) re-sets the `.inner` field.
+
         return model
     end
 end
@@ -318,7 +296,6 @@ function MOI.empty!(model::Optimizer)
     model.lazy_callback = nothing
     model.user_cut_callback = nothing
     model.heuristic_callback = nothing
-    model.basis_status = nothing
     for (name, value) in model.params
         MOI.set(model, name, value)
     end
@@ -341,8 +318,6 @@ function MOI.is_empty(model::Optimizer)
     model.lazy_callback !== nothing && return false
     model.user_cut_callback !== nothing && return false
     model.heuristic_callback !== nothing && return false
-    model.basis_status !== nothing && return false
-    model.conflict !== nothing && return false
     return true
 end
 
@@ -446,8 +421,6 @@ function MOI.set(model::Optimizer, param::MOI.RawParameter, value)
             Xpress.setlogfile(model.inner, value)
         end
         model.inner.logfile = value
-    elseif param == MOI.RawParameter("MOIWarnings")
-            model.moi_warnings = value
     elseif param == MOI.RawParameter("OUTPUTLOG")
         if value == 0
             model.silent = true
@@ -2152,7 +2125,7 @@ function MOI.optimize!(model::Optimizer)
     #     MOI.set(model, CallbackFunction(), default_moi_callback(model))
     #     model.has_generic_callback = false
     # end
-    model.basis_status = nothing
+
     reset_cached_solution(model)
     # TODO allow soling relaxed version
     # TODO deal with algorithm flags
@@ -2539,7 +2512,7 @@ end
 function MOI.set(model::Optimizer, ::MOI.Silent, flag::Bool)
     model.silent = flag
     # https://www.fico.com/fico-xpress-optimization/docs/latest/solver/optimizer/HTML/OUTPUTLOG.html
-    if Sys.iswindows() && model.moi_warnings
+    if Sys.iswindows()
         @warn "Silent has no effect on windows. See https://www.fico.com/fico-xpress-optimization/docs/latest/solver/optimizer/HTML/OUTPUTLOG.html"
     end
     MOI.set(model, MOI.RawParameter("OUTPUTLOG"), flag ? 0 : 1)
@@ -2855,38 +2828,19 @@ function MOI.set(
     return
 end
 
-function _generate_basis_status(model::Optimizer)
-    nvars = length(model.variable_info)
-    nrows = length(model.affine_constraint_info)
-    cstatus = Vector{Cint}(undef, nrows)
-    vstatus = Vector{Cint}(undef, nvars)
-    getbasis(model.inner, cstatus, vstatus)
-    basis_status = BasisStatus(cstatus, vstatus)
-    model.basis_status = basis_status
-    return
-end 
-
+#=
 
 function MOI.get(
     model::Optimizer, ::MOI.ConstraintBasisStatus,
     c::MOI.ConstraintIndex{MOI.ScalarAffineFunction{Float64}, S}
 ) where {S <: SCALAR_SETS}
     row = _info(model, c).row
-    basis_status = model.basis_status
-    if basis_status == nothing
-        _generate_basis_status(model::Optimizer)
-        basis_status = model.basis_status
-    end
-    cstatus = basis_status.con_status
-    cbasis = cstatus[row]
-    if cbasis == 1
+    # TODO
+    cbasis = 0 # get_intattrelement(model.inner, "CBasis", row)
+    if cbasis == 0
         return MOI.BASIC
-    elseif cbasis == 0
+    elseif cbasis == -1
         return MOI.NONBASIC
-    elseif cbasis == 2
-        return MOI.NONBASIC
-    elseif cbasis == 3
-        return MOI.SUPER_BASIC
     else
         error("CBasis value of $(cbasis) isn't defined.")
     end
@@ -2897,16 +2851,11 @@ function MOI.get(
     c::MOI.ConstraintIndex{MOI.SingleVariable, S}
 ) where {S <: SCALAR_SETS}
     column = _info(model, c).column
-    basis_status = model.basis_status
-    if basis_status == nothing
-        _generate_basis_status(model::Optimizer)
-        basis_status = model.basis_status
-    end
-    vstatus = basis_status.var_status
-    vbasis = vstatus[column]
-    if vbasis == 1
+    _update_if_necessary(model)
+    vbasis = get_intattrelement(model.inner, "VBasis", column)
+    if vbasis == 0
         return MOI.BASIC
-    elseif vbasis == 0
+    elseif vbasis == -1
         if S <: MOI.LessThan
             return MOI.BASIC
         elseif !(S <: MOI.Interval)
@@ -2914,7 +2863,8 @@ function MOI.get(
         else
             return MOI.NONBASIC_AT_LOWER
         end
-    elseif vbasis == 2
+    elseif vbasis == -2
+        MOI.NONBASIC_AT_UPPER
         if S <: MOI.GreaterThan
             return MOI.BASIC
         elseif !(S <: MOI.Interval)
@@ -2922,12 +2872,14 @@ function MOI.get(
         else
             return MOI.NONBASIC_AT_UPPER
         end
-    elseif vbasis == 3
+    elseif vbasis == -3
         return MOI.SUPER_BASIC
     else
         error("VBasis value of $(vbasis) isn't defined.")
     end
 end
+
+=#
 
 ###
 ### VectorOfVariables-in-SecondOrderCone
@@ -3226,67 +3178,7 @@ end
 ### IIS
 ###
 
-function getinfeasbounds(model::Optimizer)
-    nvars = length(model.variable_info)
-    lbs = getlb(model.inner, 1, nvars)
-    ubs = getub(model.inner, 1, nvars)
-    check_bounds = lbs .<= ubs
-    if sum(check_bounds) == nvars
-        error("There was an error in computation")
-    end
-    if model.moi_warnings
-        @warn "Xpress can't find IIS with invalid bounds, the constraints that keep the model infeasible can't be found, only the infeasible bounds will be available"
-    end
-    col = 1
-    ncols = 0
-    infeas_cols = []
-    for check_col in check_bounds
-        if !check_col
-            push!(infeas_cols, col)
-            ncols += 1
-        end
-        col += 1
-    end
-    miiscol = Vector{Cint}(undef, ncols)
-    for col = 1:ncols
-        miiscol[col] = infeas_cols[col]
-    end
-    return ncols, miiscol
-end
-
-function getfirstiis(model::Optimizer)
-    iismode = Cint(1)
-    status_code = Array{Cint}(undef, 1)
-    Lib.XPRSiisfirst(model.inner, iismode, status_code)
-
-    if status_code[1] == 1
-        # The problem is actually feasible.
-        return IISData(status_code[1], true, 0, 0, Vector{Cint}(undef, 0), Vector{Cint}(undef, 0), Vector{UInt8}(undef, 0), Vector{UInt8}(undef, 0))
-    elseif status_code[1] == 2
-        ncols, miiscol = getinfeasbounds(model)
-        return IISData(status_code[1], false, 0, ncols, Vector{Cint}(undef, 0), miiscol, Vector{UInt8}(undef, 0), Vector{UInt8}(undef, 0))
-    end
-    
-    # XPRESS' API works in two steps: first, retrieve the sizes of the arrays to
-    # retrieve; then, the user is expected to allocate the needed memory,
-    # before asking XPRESS to fill it.
-
-    num = Cint(1)
-    rownumber = Vector{Cint}(undef, 1)
-    colnumber = Vector{Cint}(undef, 1)
-    Xpress.getiisdata(model.inner, num, rownumber, colnumber, C_NULL, C_NULL, C_NULL, C_NULL, C_NULL, C_NULL, C_NULL, C_NULL)
-
-    nrows = rownumber[1]
-    ncols = colnumber[1]
-    miisrow = Vector{Cint}(undef, nrows)
-    miiscol = Vector{Cint}(undef, ncols)
-    constrainttype = Vector{UInt8}(undef, nrows)
-    colbndtype = Vector{UInt8}(undef, ncols)
-    Xpress.getiisdata(model.inner, num, rownumber, colnumber, miisrow, miiscol, constrainttype, colbndtype, C_NULL, C_NULL, C_NULL, C_NULL)
-
-    return IISData(status_code[1], true, nrows, ncols, miisrow, miiscol, constrainttype, colbndtype)
-
-end
+#=
 
 """
     compute_conflict(model::Optimizer)
@@ -3294,17 +3186,41 @@ end
 Compute a minimal subset of the constraints and variables that keep the model
 infeasible.
 
-"""
+See also `CPLEX.ConflictStatus` and `CPLEX.ConstraintConflictStatus`.
 
+Note that if `model` is modified after a call to `compute_conflict`, the
+conflict is not purged, and any calls to the above attributes will return
+values for the original conflict without a warning.
+"""
 function compute_conflict(model::Optimizer)
-    model.conflict = getfirstiis(model)
+    # In case there is no conflict, c_api_getconflict throws an error, while the
+    # conflict data structure can handle more gracefully this case (via a status
+    # check).
+
+    # TODO: decide what to do about the POSSIBLE statuses for the constraints
+    # (CPX_CONFLICT_POSSIBLE_MEMBER, CPX_CONFLICT_POSSIBLE_UB,
+    # CPX_CONFLICT_POSSIBLE_LB).
+    try
+        model.conflict = c_api_getconflict(model.inner)
+    catch exc
+        if isa(exc, CplexError) && exc.code == CPXERR_NO_CONFLICT
+            model.conflict = ConflictRefinerData(
+                CPX_STAT_CONFLICT_FEASIBLE, 0, Cint[], Cint[], 0, Cint[], Cint[]
+            )
+        else
+            rethrow(exc)
+        end
+    end
     return
 end
 
 function _ensure_conflict_computed(model::Optimizer)
     if model.conflict === nothing
-        error("Cannot access conflict status. Call `Xpress.compute_conflict(model)` first. " *
-              "In case the model is modified, the computed conflict will not be purged.")
+        error(
+            "Cannot access conflict status. Call " *
+            "`CPLEX.compute_conflict(model)` first. In case the model is " *
+            "modified, the computed conflict will not be purged."
+        )
     end
 end
 
@@ -3324,10 +3240,26 @@ MOI.is_set_by_optimize(::ConflictStatus) = true
 function MOI.get(model::Optimizer, ::ConflictStatus)
     if model.conflict === nothing
         return MOI.OPTIMIZE_NOT_CALLED
-    elseif model.conflict.stat == 0 || !model.conflict.is_standard_iis 
+    elseif model.conflict.stat == CPX_STAT_CONFLICT_MINIMAL
         return MOI.OPTIMAL
-    elseif model.conflict.stat == 1
+    elseif model.conflict.stat == CPX_STAT_CONFLICT_FEASIBLE
         return MOI.INFEASIBLE
+    elseif model.conflict.stat == CPX_STAT_CONFLICT_ABORT_CONTRADICTION
+        return MOI.OTHER_LIMIT
+    elseif model.conflict.stat == CPX_STAT_CONFLICT_ABORT_DETTIME_LIM
+        return MOI.TIME_LIMIT
+    elseif model.conflict.stat == CPX_STAT_CONFLICT_ABORT_IT_LIM
+        return MOI.ITERATION_LIMIT
+    elseif model.conflict.stat == CPX_STAT_CONFLICT_ABORT_MEM_LIM
+        return MOI.MEMORY_LIMIT
+    elseif model.conflict.stat == CPX_STAT_CONFLICT_ABORT_NODE_LIM
+        return MOI.NODE_LIMIT
+    elseif model.conflict.stat == CPX_STAT_CONFLICT_ABORT_OBJ_LIM
+        return MOI.OBJECTIVE_LIMIT
+    elseif model.conflict.stat == CPX_STAT_CONFLICT_ABORT_TIME_LIM
+        return MOI.TIME_LIMIT
+    elseif model.conflict.stat == CPX_STAT_CONFLICT_ABORT_USER
+        return MOI.OTHER_LIMIT
     else
         return MOI.OTHER_LIMIT
     end
@@ -3343,19 +3275,73 @@ end
 A Boolean constraint attribute indicating whether the constraint participates
 in the last computed conflict.
 """
-
 struct ConstraintConflictStatus <: MOI.AbstractConstraintAttribute end
 
 MOI.is_set_by_optimize(::ConstraintConflictStatus) = true
 
-function MOI.get(model::Optimizer, ::ConstraintConflictStatus, index::MOI.ConstraintIndex{<:MOI.ScalarAffineFunction, <:Union{MOI.LessThan, MOI.GreaterThan, MOI.EqualTo}})
+function _get_conflict_status(
+    model::Optimizer,
+    index::MOI.ConstraintIndex{MOI.SingleVariable, <:Any}
+)
     _ensure_conflict_computed(model)
-    return (_info(model, index).row - 1) in model.conflict.miisrow
+    column = _info(model, index).column
+    for (col, stat) in zip(model.conflict.colind, model.conflict.colstat)
+        if column - 1 == col
+            return stat
+        end
+    end
+    return nothing
 end
 
-function MOI.get(model::Optimizer, ::ConstraintConflictStatus, index::MOI.ConstraintIndex{<:MOI.SingleVariable, <:Union{MOI.LessThan, MOI.GreaterThan, MOI.EqualTo}})
+function MOI.get(
+    model::Optimizer,
+    ::ConstraintConflictStatus,
+    index::MOI.ConstraintIndex{MOI.SingleVariable, <:MOI.LessThan}
+)
+    status = _get_conflict_status(model, index)
+    if status === nothing
+        return false
+    end
+    return status == CPLEX.CPX_CONFLICT_MEMBER ||
+        status == CPLEX.CPX_CONFLICT_UB
+end
+
+function MOI.get(
+    model::Optimizer,
+    ::ConstraintConflictStatus,
+    index::MOI.ConstraintIndex{MOI.SingleVariable, <:MOI.GreaterThan})
+    status = _get_conflict_status(model, index)
+    if status === nothing
+        return false
+    end
+    return status == CPLEX.CPX_CONFLICT_MEMBER ||
+        status == CPLEX.CPX_CONFLICT_LB
+end
+
+function MOI.get(
+    model::Optimizer,
+    ::ConstraintConflictStatus,
+    index::MOI.ConstraintIndex{MOI.SingleVariable, <:Union{MOI.EqualTo, MOI.Interval}}
+)
+    status = _get_conflict_status(model, index)
+    if status === nothing
+        return false
+    end
+    return status == CPLEX.CPX_CONFLICT_MEMBER ||
+        status == CPLEX.CPX_CONFLICT_LB ||
+        status == CPLEX.CPX_CONFLICT_UB
+end
+
+function MOI.get(
+    model::Optimizer,
+    ::ConstraintConflictStatus,
+    index::MOI.ConstraintIndex{
+        <:MOI.ScalarAffineFunction,
+        <:Union{MOI.LessThan, MOI.GreaterThan, MOI.EqualTo}
+    }
+)
     _ensure_conflict_computed(model)
-    return (_info(model, index).column) in model.conflict.miiscol
+    return (_info(model, index).row - 1) in model.conflict.rowind
 end
 
 function MOI.supports(
@@ -3377,10 +3363,8 @@ function MOI.supports(
     return true
 end
 
-#=
 include("MOI_callbacks.jl")
 =#
-
 function extension(str::String)
     try
         match(r"\.[A-Za-z0-9]+$", str).match

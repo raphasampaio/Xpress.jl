@@ -57,7 +57,6 @@ module Xpress
 
     include("MOI/MOI_wrapper.jl")
 
-	println("foca")
     function __init__()
         # Xpress.initialize()
     end
